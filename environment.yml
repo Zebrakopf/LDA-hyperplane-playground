@@ -1,0 +1,22 @@
+name: lda_patch_lab
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - scikit-learn
+  - pandas
+  - pyarrow             # parquet trial tables (storage/io.py)
+  - joblib
+  - pytest              # the test suite is part of the deliverable, not optional
+  # The app. The version floor is load-bearing: st.plotly_chart(on_select=...)
+  # arrived in 1.35, and canvas clicks are dead without it (decisions.md D10).
+  - streamlit>=1.35
+  - plotly              # interactive figures (ui/plots.py)
+  - matplotlib          # static figures for headless runs (scripts/figures.py)
+  - pip
+  - pip:
+      - pydantic
+      # NOT used: streamlit-drawable-canvas. Native Plotly click events do the
+      # same job with no extra dependency -- see docs/decisions.md D10.

@@ -1,0 +1,136 @@
+{
+  "data": {
+    "name": "heat_dead_anti",
+    "plane": {
+      "height": 100,
+      "width": 100
+    },
+    "pivot": 0.5,
+    "background_gain": 1.0,
+    "overlap_mode": "blend",
+    "zones": [
+      {
+        "id": "heat1",
+        "kind": "heat",
+        "center_x": 25.0,
+        "center_y": 25.0,
+        "radius": 15.0,
+        "gain": 2.0,
+        "offset": 0.0,
+        "falloff": "smoothstep",
+        "falloff_width": 3.0,
+        "priority": 0
+      },
+      {
+        "id": "heat2",
+        "kind": "heat",
+        "center_x": 70.0,
+        "center_y": 30.0,
+        "radius": 10.0,
+        "gain": 2.0,
+        "offset": 0.0,
+        "falloff": "smoothstep",
+        "falloff_width": 3.0,
+        "priority": 0
+      },
+      {
+        "id": "dead1",
+        "kind": "dead",
+        "center_x": 30.0,
+        "center_y": 72.0,
+        "radius": 18.0,
+        "gain": 0.05,
+        "offset": 0.0,
+        "falloff": "smoothstep",
+        "falloff_width": 3.0,
+        "priority": 0
+      },
+      {
+        "id": "dead2",
+        "kind": "dead",
+        "center_x": 75.0,
+        "center_y": 75.0,
+        "radius": 12.0,
+        "gain": 0.05,
+        "offset": 0.0,
+        "falloff": "smoothstep",
+        "falloff_width": 3.0,
+        "priority": 0
+      },
+      {
+        "id": "anti1",
+        "kind": "anti",
+        "center_x": 50.0,
+        "center_y": 50.0,
+        "radius": 12.0,
+        "gain": -0.8,
+        "offset": 0.0,
+        "falloff": "smoothstep",
+        "falloff_width": 3.0,
+        "priority": 0
+      }
+    ],
+    "jitter": {
+      "enabled": false,
+      "center_sigma_px": 0.0,
+      "radius_sigma_px": 0.0,
+      "gain_sigma": 0.0
+    },
+    "noise": {
+      "pixel_model": "bernoulli",
+      "sigma": 0.1,
+      "beta_concentration": 20.0,
+      "theta_eps": 0.001,
+      "random_zone_dist": "bernoulli_half"
+    }
+  },
+  "sampling": {
+    "name": "uniform_grid_step10",
+    "patch_size": 5,
+    "layout": "uniform_grid",
+    "grid_step": 10,
+    "n_patches": null,
+    "layout_jitter_px": 0.0,
+    "snap_to_grid": null,
+    "feature_mode": "pixels",
+    "patches": []
+  },
+  "training": {
+    "c_lo": 0.05,
+    "c_hi": 0.95,
+    "n_per_class": 400,
+    "solver": "lsqr",
+    "shrinkage": "auto",
+    "standardize": true,
+    "shuffle_labels": false,
+    "cv_folds": 5
+  },
+  "evaluation": {
+    "contrast_grid": [
+      0.0,
+      0.05,
+      0.1,
+      0.15000000000000002,
+      0.2,
+      0.25,
+      0.30000000000000004,
+      0.35000000000000003,
+      0.4,
+      0.45,
+      0.5,
+      0.55,
+      0.6000000000000001,
+      0.65,
+      0.7000000000000001,
+      0.75,
+      0.8,
+      0.8500000000000001,
+      0.9,
+      0.9500000000000001,
+      1.0
+    ],
+    "n_per_contrast": 200,
+    "compute_oracle": true
+  },
+  "master_seed": 0
+}
