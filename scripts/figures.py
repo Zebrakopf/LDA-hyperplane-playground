@@ -13,9 +13,9 @@ a batch run (see docs/decisions.md).
 
 The four panels
 ---------------
-1. f(c) with spread band, plus the oracle readout on a second axis
+1. f(c) with spread band and the oracle, both affinely normalised
 2. residuals from the affine fit — the SHAPE of any failure
-3. SD(f|c) and clip activity — the H3 and saturation evidence
+3. SD(f|c), with clip activity in the title — the H3 and saturation evidence
 4. learned weight map beside the true gain field — the attribution check
 """
 
@@ -40,39 +40,45 @@ COLOUR_REFERENCE = "#888888"
 COLOUR_FILL = "#1f6fb4"
 
 
-def _panel_mapping(ax: plt.Axes, result: ExperimentResult) -> None:
-    """f(c): mean curve, +/-1 SD band, and the affine fit it is judged against."""
-    report = result.report
+def _normalised(report) -> tuple[np.ndarray, np.ndarray, bool]:
+    """Mean curve scaled so its own affine fit runs 0 -> 1 (see ui/plots.py).
+
+    Lets the LDA and the oracle share ONE axis honestly; the first version put
+    the oracle on a second y-axis, which invites reading crossings as meaning.
+    """
     curve = report.mean_by_c
     c = curve["c"].to_numpy()
-    mean_f = curve["mean_f"].to_numpy()
-    sd_f = curve["sd_f"].to_numpy()
+    if report.verdict == "degenerate" or report.beta1 == 0.0:
+        return c, curve["mean_f"].to_numpy(), False
+    lo = report.beta0 + report.beta1 * c.min()
+    return c, (curve["mean_f"].to_numpy() - lo) / (report.beta1 * np.ptp(c)), True
 
-    ax.fill_between(c, mean_f - sd_f, mean_f + sd_f, color=COLOUR_FILL, alpha=0.18,
-                    linewidth=0, label="±1 SD across trials")
-    ax.plot(c, mean_f, color=COLOUR_LDA, marker="o", markersize=3, label="LDA  f(c)")
-    ax.plot(c, report.beta0 + report.beta1 * c, color=COLOUR_REFERENCE,
-            linestyle="--", linewidth=1.2, label="affine fit")
 
-    if result.oracle_report is not None:
-        # Oracle is on the same scaled features but its own scale, so it gets a
-        # twin axis: comparing raw f across readouts is meaningless (CLAUDE.md
-        # §11, trap 8). Only the SHAPE is being compared here.
-        twin = ax.twinx()
-        oracle_curve = result.oracle_report.mean_by_c
-        twin.plot(oracle_curve["c"], oracle_curve["mean_f"], color=COLOUR_ORACLE,
-                  linewidth=1.2, linestyle="-.", label="oracle (right axis)")
-        twin.set_ylabel("oracle decision value", color=COLOUR_ORACLE, fontsize=8)
-        twin.tick_params(axis="y", labelcolor=COLOUR_ORACLE, labelsize=7)
-        twin.legend(loc="lower right", fontsize=7, frameon=False)
+def _panel_mapping(ax: plt.Axes, result: ExperimentResult) -> None:
+    """f(c) against the straight line it is judged against, on one axis."""
+    report = result.report
+    c, g, ok = _normalised(report)
+    sd = np.nan_to_num(report.mean_by_c["sd_f"].to_numpy())
+    if ok:
+        sd = sd / abs(report.beta1 * np.ptp(c))
+        ax.plot([c.min(), c.max()], [0, 1], color=COLOUR_REFERENCE, linestyle="--",
+                linewidth=1.2, label="perfectly affine")
+    ax.fill_between(c, g - sd, g + sd, color=COLOUR_FILL, alpha=0.18, linewidth=0,
+                    label="±1 SD across trials")
+    ax.plot(c, g, color=COLOUR_LDA, marker="o", markersize=3, label="LDA readout")
+    if ok and result.oracle_report is not None:
+        oc, og, oracle_ok = _normalised(result.oracle_report)
+        if oracle_ok:
+            ax.plot(oc, og, color=COLOUR_ORACLE, linewidth=1.2, linestyle="-.",
+                    label="oracle (true gains)")
 
-    kappa = report.curvature_index
-    kappa_text = "n/a" if kappa is None else f"{kappa:.3f}"
-    ax.set_title(f"verdict: {report.verdict}   κ = {kappa_text}   "
-                 f"ρ = {report.spearman_rho:.3f}   r = {report.pearson_r:.3f}",
-                 fontsize=9)
+    def fmt(v):
+        return "n/a" if v is None else f"{v:.3f}"
+    ax.set_title(f"verdict: {report.verdict}   κ = {fmt(report.curvature_index)} "
+                 f"(κ₂ {fmt(report.kappa_quadratic)}, κ₃ {fmt(report.kappa_cubic)})   "
+                 f"ρ = {report.spearman_rho:.3f}", fontsize=9)
     ax.set_xlabel("latent contrast c  (ground truth)")
-    ax.set_ylabel("LDA decision value f")
+    ax.set_ylabel("readout, affine fit scaled 0 → 1" if ok else "LDA decision value f")
     ax.legend(loc="upper left", fontsize=7, frameon=False)
 
 
@@ -98,18 +104,13 @@ def _panel_spread(ax: plt.Axes, result: ExperimentResult) -> None:
     ax.set_xlabel("latent contrast c")
     ax.set_ylabel("SD of f across trials")
     verdict = "homoscedastic" if report.homoscedastic else "HETEROSCEDASTIC"
-    ax.set_title(f"spread: {verdict}   max/min = {report.sd_ratio:.2f}", fontsize=9)
 
-    twin = ax.twinx()
-    twin.plot(report.clip_by_c["c"], report.clip_by_c["mean_clip_fraction"],
-              color=COLOUR_ORACLE, linestyle=":", label="clipped pixel fraction")
-    twin.set_ylabel("clip fraction", color=COLOUR_ORACLE, fontsize=8)
-    twin.tick_params(axis="y", labelcolor=COLOUR_ORACLE, labelsize=7)
-    twin.set_ylim(bottom=0.0)
-
-    handles = ax.get_legend_handles_labels()[0] + twin.get_legend_handles_labels()[0]
-    labels = ax.get_legend_handles_labels()[1] + twin.get_legend_handles_labels()[1]
-    ax.legend(handles, labels, loc="best", fontsize=7, frameon=False)
+    # Clip activity goes in the title rather than on a second y-axis (D16).
+    clipped = report.clip_by_c["mean_clip_fraction"]
+    ax.set_title(f"spread: {verdict}   max/min = {report.sd_ratio:.2f}   "
+                 f"clipped: {clipped.mean():.1%} mean, {clipped.max():.1%} max",
+                 fontsize=9)
+    ax.legend(loc="best", fontsize=7, frameon=False)
 
 
 def _panel_attribution(ax_left: plt.Axes, ax_right: plt.Axes,

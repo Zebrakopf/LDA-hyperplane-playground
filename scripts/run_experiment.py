@@ -55,8 +55,9 @@ def describe(result: ExperimentResult) -> str:
     """
     report = result.report
     diagnostics = result.model.diagnostics
-    kappa = "n/a (degenerate)" if report.curvature_index is None \
-        else f"{report.curvature_index:.4f}"
+    kappa = ("n/a (degenerate)" if report.curvature_index is None
+             else f"{report.curvature_index:.4f} (quadratic {report.kappa_quadratic:.4f}"
+                  f", cubic {report.kappa_cubic:.4f})")
     calibration = ("n/a" if report.calibration is None
                    else f"{report.calibration['rmse'].mean():.4f}")
     oracle = ("not computed" if result.oracle_report is None else
@@ -178,6 +179,12 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_save:
         args.results_dir.mkdir(parents=True, exist_ok=True)
         summary_path = args.results_dir / "summary_table.csv"
+        # Merge with earlier batches instead of overwriting them; a re-run of the
+        # same run_id replaces its own row (run ids are deterministic).
+        if summary_path.exists():
+            previous = pd.read_csv(summary_path)
+            previous = previous[~previous["run_id"].isin(table["run_id"])]
+            table = pd.concat([previous, table], ignore_index=True)
         table.to_csv(summary_path, index=False)
         print(f"\nwrote {summary_path}")
     return 0
