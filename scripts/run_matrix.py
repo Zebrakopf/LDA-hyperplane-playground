@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pandas as pd
 
-from core.config import JitterSpec, NoiseSpec, RunConfig
+from core.config import JitterSpec, NoiseSpec, RunConfig, TrainingConfig
 from core.evaluation import run_experiment
 from storage.io import load_run_config, provenance, run_identifiers, save_result
 
@@ -100,11 +100,36 @@ def build_cells(base: RunConfig, factors: set[str]) -> list[Cell]:
     if "solver" in factors:
         for label, solver, shrinkage in SOLVER_CELLS:
             cfg = base.model_copy(deep=True)
-            cfg.training.solver = solver              # type: ignore[assignment]
-            cfg.training.shrinkage = shrinkage        # type: ignore[assignment]
+            # Both fields in one validated step: with validate_assignment on,
+            # setting solver="svd" first would be rejected while shrinkage is
+            # still "auto".
+            cfg.training = TrainingConfig.model_validate(
+                {**cfg.training.model_dump(), "solver": solver,
+                 "shrinkage": shrinkage})
             cfg.data.name = f"{base.data.name}__{label.replace('/', '_')}"
             cells.append(Cell("solver", label, cfg))
-    return cells
+    return _drop_duplicate_cells(cells)
+
+
+def _drop_duplicate_cells(cells: list[Cell]) -> list[Cell]:
+    """Drop cells whose config is identical to an earlier one.
+
+    Several factor levels equal the base config (`jitter/off`,
+    `features/pixels`, `solver/lsqr+auto` on the default base), so without this
+    the same experiment runs three times per seed. Compared on everything except
+    the display name, which each cell rewrites.
+    """
+    seen: set[str] = set()
+    unique: list[Cell] = []
+    for cell in cells:
+        signature = cell.config.model_copy(
+            update={"data": cell.config.data.model_copy(update={"name": ""})}
+        ).model_dump_json()
+        if signature in seen:
+            continue
+        seen.add(signature)
+        unique.append(cell)
+    return unique
 
 
 ALL_FACTORS = ("pixel_noise", "jitter", "features", "solver")

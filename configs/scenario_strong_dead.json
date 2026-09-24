@@ -6,7 +6,7 @@
       "width": 100
     },
     "pivot": 0.5,
-    "background_gain": 0.4,
+    "background_gain": 0.5,
     "overlap_mode": "blend",
     "zones": [
       {

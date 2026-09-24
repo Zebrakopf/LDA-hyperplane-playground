@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Emit the canonical Phase-1 config files into `configs/`.
 
-Why a generator rather than ten hand-written JSON files: the sampling-ablation
+Why a generator rather than eleven hand-written JSON files: the sampling-ablation
 configs (plan.md §7.5, control 5) need explicit patch lists computed from zone
 geometry, and hand-typing coordinates is exactly the kind of silent error this
 project cannot detect from its output. Run this once; commit the JSON it writes.
@@ -128,9 +128,12 @@ def build_configs() -> dict[str, RunConfig]:
     configs["scenario_heat_dead"] = RunConfig(data=heat_dead_data,
                                               sampling=UNIFORM_SAMPLING)
     configs["scenario_strong_dead"] = RunConfig(
-        # The clip-free counterpart: background_gain 0.4 with strong gain 1.0
-        # gives the same 2.5x zone-to-background ratio without ever saturating.
-        data=DataConfig(name="strong_dead", plane=PLANE, background_gain=0.4,
+        # The clip-free counterpart to heat_dead. heat = gain 2.0 over background
+        # 1.0; strong = gain 1.0 over background 0.5. Both are exactly 2x their
+        # surround, so the pair differs in saturation and nothing else. (The first
+        # version used background 0.4 — a 2.5x ratio — and so mixed saturation
+        # with a different coupling ratio; docs/decisions.md D14.)
+        data=DataConfig(name="strong_dead", plane=PLANE, background_gain=0.5,
                         zones=strong + dead, noise=low_noise),
         sampling=UNIFORM_SAMPLING,
     )
