@@ -1,13 +1,13 @@
 # LDA hyperplane check
 
-An interactive sandbox for to explore the following assumption:
+An interactive sandbox for a belief that gets repeated in the lab but rarely tested:
 
 > Train an LDA on the **two extremes** of a latent variable, and its decision value
 > varies **linearly** with that variable in between.
 
 You build a world where you decide how the latent variable drives the pixels — heat
 zones, dead zones, anti-correlated zones, random zones, jitter — choose where the
-model gets to look, press a button, and see whether the readout actually comes out
+model gets to look, press a button, and see whether the readout comes out
 straight. Everything is simulated, so the ground truth is exact and the diagnostics
 won't let a bent curve pass as a straight one.
 
@@ -19,78 +19,83 @@ conda activate lda_patch_lab
 streamlit run app.py
 ```
 
-Python 3.11. Runs entirely on your machine — nothing is deployed.
+Python 3.11, Streamlit ≥ 1.55. Runs entirely on your machine — nothing is deployed.
 
 ## Five-minute tour
 
 1. **Press ▶ Train & evaluate.** The default world is uniform: every pixel tracks
-   the latent contrast `c` equally, so you should get `verdict: affine` with κ ≈ 0.
+   the latent contrast `c` equally, so you should get **✓ affine** with κ ≈ 0.
    That's the sanity check.
-2. **Click the canvas** with `zone: heat` selected — a region that tracks `c` twice
-   as steeply as its surround. Slide **preview contrast** away from 0.5 to see it.
-   Train again.
-3. **Add a `zone: dead`.** Now part of the plane barely responds. Check the **what
-   the model used** tab: weight should land on the heat zone, not the dead one.
-4. **Break it on purpose.** Set **background gain** to 0 — nothing tracks `c`. You
-   should get `degenerate`, not a plausible line. That control is what proves the
-   tool isn't manufacturing structure.
-5. **Compare worlds.** Train, switch the pixel model from `bernoulli` to
-   `clipped_gaussian`, train again, open **compare models**.
+2. **Pick `heat` above the canvas and click on it** — a region that tracks `c`
+   twice as steeply as its surround. Slide **preview at contrast c** away from 0.5
+   to see it, or switch on **gain map**. Train again.
+3. **Add a `dead` zone.** Now part of the plane barely responds. The **What the
+   model used** tab shows where the LDA put its weight.
+4. **Break it on purpose.** Set **background gain** to 0 in the sidebar — nothing
+   tracks `c`. You should get **○ degenerate**, not a plausible line. That control
+   is what proves the tool isn't manufacturing structure.
+5. **Find a real failure.** Load `scenario_heat_dead` from the sidebar's Configs,
+   switch the pixel model to `beta` and train — see below. (Beta on the plain
+   uniform world stays straight; it takes the saturating zones as well.)
 
-Every control has a tooltip. The **speed preset** starts on `fast (explore)`, which
-returns in under a second; switch to `careful` before believing a number.
+Every control has a tooltip. The speed preset starts on `fast (explore)`, which
+returns in under a second; use `careful` before believing a number.
 
 ## Reading the output
 
 | what | means |
 |------|-------|
-| `verdict` | `affine` / `equivocal` / `nonlinear` / `degenerate`, by thresholds fixed before any result was seen |
-| **κ** | curvature index, `\|β₂\|/\|β₁\|`. Below 0.05 affine, above 0.15 a clear bend. **The headline number.** |
-| `r` | Pearson. Never read alone — an S-shaped curve sits happily at r = 0.99 |
-| SD max/min | how much the *precision* varies across the range (a separate failure from a bent curve) |
-| `degenerate` | the slope isn't resolved above noise. The **correct** answer when nothing tracks `c` |
-| oracle | a readout built from the true gain field — separates "the LDA failed" from "no linear readout existed" |
+| verdict | ✓ affine · ~ equivocal · ✗ nonlinear · ○ degenerate · ! fit failed — thresholds fixed before any result was seen |
+| **κ** | curvature, `√(κ₂² + κ₃²)`: quadratic (one-sided bend) plus cubic (S-shape) part. Below 0.05 affine, above 0.15 a clear bend. **The headline number.** |
+| range use | share of the output spent on the middle half of `c`. A straight line is 0.50; an S-curve more |
+| `r` | Pearson. Never read alone — an S-curve sits happily at r = 0.99 |
+| SD max/min | how much the *precision* varies across the range — a separate failure from a bent curve |
+| oracle | a readout built from the true gains — separates "the LDA failed" from "no linear readout existed" |
 
-## Ready-made worlds
+## What we found
 
-`configs/` holds eleven configs, loadable from the right-hand panel. The controls
-matter most — they're what makes the tool trustworthy:
+11 configs × 5 seeds at the pre-registered settings, plus a pixel-model, solver
+and feature sweep. Details in [`details.md`](details.md) and
+[`docs/decisions.md`](docs/decisions.md) (F3, F4).
 
-- `control_simple` → must come out `affine`
-- `control_all_dead`, `control_all_random`, `control_label_shuffle` → must come out
-  `degenerate`
-- `scenario_heat_dead*` → heterogeneous worlds, with variants adding anti-correlated
-  regions, random regions and jitter
-- `ablation_heat_only` / `ablation_dead_only` → the same world, sampled only where
-  the signal is / isn't
+**Linearity holds in the simple regime and fails in several realistic ones.** With
+Bernoulli pixels the readout stays affine (κ < 0.01) even with saturating, dead
+and anti-correlated zones. The LDA is actually straighter than the ideal
+gain-weighted readout, because it learns to down-weight pixels that clip. It
+**bends** when:
+
+| condition | LDA κ | oracle κ | meaning |
+|---|---|---|---|
+| Beta pixel noise + saturating zones | **0.20** (5/5 seeds) | 0.045 (affine) | the method bends where a straight readout exists |
+| clipped-Gaussian noise | 0.07–0.08 | 0.06–0.09 | mostly the censoring itself |
+| patches only on saturating zones | 0.19 | 0.21 | baked into what the observer sees |
+| zones that jitter between trials | 0.05–0.06 | 0.048 | on the threshold, ~7× the no-jitter value |
+
+**Precision varies everywhere.** SD max/min exceeded the threshold in every
+non-null condition, including the uniform world, and the readout contributes:
+switching the solver alone moves it from 48 to 7. Statistics that treat decision
+values as equally precise measurements rest on an assumption this simulation does
+not support.
+
+> An earlier version of this README said linearity held everywhere. That was
+> measured with a curvature index that could not see S-shaped curves — the shape
+> saturation produces. See D14.
 
 ## Without the app
 
 ```bash
-pytest                                                        # 62 tests, ~8 s
+pytest                                                        # 103 tests, ~30 s
 python -m scripts.run_experiment configs/scenario_heat_dead.json --figures
-python -m scripts.run_matrix --factors pixel_noise --seeds 0 --no-cv
+python -m scripts.run_matrix --factors pixel_noise --seeds 0 1 2 3 4 --no-cv
 ```
 
-Results land in `results/`, models in `models/` — both git-ignored and reproducible
-from a config plus a seed.
-
-## What the first pass found
-
-The linearity assumption **held** everywhere tested: κ between 0.0000 and 0.0021,
-including with saturating zones, anti-correlated regions, jitter and all three pixel
-models. The *precision* assumption did not — SD max/min ranged 1.67 to 46.98, driven
-by the observation model rather than the LDA.
-
-So the mean decision value tracks the latent variable faithfully, but the error bar
-on a single trial can differ by more than an order of magnitude across the range.
-If anyone is doing statistics on decision values as equally precise measurements,
-that's the assumption worth worrying about — not the linearity one it usually
-travels with. One seed so far; see `details.md`.
+Results land in `results/`, models in `models/` — both git-ignored and
+reproducible from a config plus a seed. Configs saved from the app go to
+`configs/user/`.
 
 ## More
 
-- **[`details.md`](details.md)** — the generative model, zone kinds, pixel models,
+- **[`details.md`](details.md)** — the world model, zone kinds, pixel models,
   gotchas, full CLI, findings, code layout.
 - **[`plan.md`](plan.md)** — experiment design, hypotheses, architecture.
 - **[`CLAUDE.md`](CLAUDE.md)** — working agreement: invariants, commenting rules,

@@ -62,9 +62,13 @@ Fixed before looking at results, so "significant" is not decided post hoc.
 
 Quantities (defined in §7.2):
 
-- `kappa` = `|β₂| / |β₁|` from an orthogonal-polynomial fit on the standardised
-  contrast grid — an **effect size**, and the primary criterion.
-- Nested F-test, affine vs. affine + quadratic, at α = 0.01.
+- `kappa` = `√(κ₂² + κ₃²)`, where `κ₂ = |β₂|/|β₁|` and `κ₃ = |β₃|/|β₁|` from an
+  orthogonal-polynomial fit (to cubic) on the standardised contrast grid — an
+  **effect size**, and the primary criterion. **Revised September 2026** from
+  `|β₂|/|β₁|` alone, which scored a symmetric S-curve (the shape saturation
+  around the pivot produces) as affine (`docs/decisions.md` D14).
+- Nested F-tests, affine vs. + quadratic and + quadratic vs. + cubic, at α = 0.01;
+  either being significant counts in the `nonlinear` branch below.
 - `sd_ratio` = max SD(f‖c) / min SD(f‖c), computed over levels with **nonzero**
   SD; `n_zero_variance_levels` reports how many were excluded. Bernoulli pixels
   have zero variance at `theta ∈ {0,1}`, so without this the ratio is `inf` for
@@ -81,8 +85,9 @@ Quantities (defined in §7.2):
 | Verdict | Condition |
 |---------|-----------|
 | `degenerate` | **`slope_t` = |β₁| / SE(β₁) < 10** ⇒ the slope is unresolved and every slope-normalised quantity is undefined (0/0): `kappa`, calibration, effective-range-use, max-local-slope-ratio. Applies by design to the null controls in §7.5. |
+| `fit_failed` | set by `run_experiment` when the LDA had nothing to learn (every feature constant within each training class). Distinct from `degenerate`: that says c is not linearly readable, this says no fit happened (D14). |
 | `affine` | `kappa < 0.05` |
-| `nonlinear` | `kappa > 0.15`, **or** `kappa ≥ 0.05` **and** nested F significant at α = 0.01 |
+| `nonlinear` | `kappa > 0.15`, **or** `kappa ≥ 0.05` **and** either nested F (quadratic or cubic) significant at α = 0.01 |
 | `equivocal` | otherwise (i.e. `0.05 ≤ kappa ≤ 0.15` with a non-significant curvature term) |
 
 `kappa` takes precedence over the p-value deliberately: with 4200 evaluation
@@ -245,8 +250,10 @@ real experimental knob, not boilerplate — see the `strong` row.
   `theta = 2c − 0.5`, which tracks `c` twice as steeply as its surround and
   leaves `[0,1]` for `c ≤ 0.20` and `c ≥ 0.80` — **10 of the 21 default grid
   points (48%)** clip, half the continuous range;
-- a `strong` zone at `gain = 1.0` with `background_gain = 0.4` gives
-  `theta = c` exactly, tracks 2.5× as steeply as its surround, and never clips.
+- a `strong` zone at `gain = 1.0` with `background_gain = 0.5` gives
+  `theta = c` exactly, tracks 2× as steeply as its surround — the same ratio as
+  `heat` — and never clips. (Originally background 0.4, a 2.5× ratio, which mixed
+  saturation with a different coupling ratio; corrected in D14.)
 
 Comparing the two isolates saturation from heterogeneity.
 

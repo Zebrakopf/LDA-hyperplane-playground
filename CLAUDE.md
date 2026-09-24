@@ -82,7 +82,7 @@ LDA_hyperplane_check/
 │
 ├── tests/                     # pytest
 ├── models/                    # saved .joblib (git-ignored)
-├── configs/                   # saved .json configs (committed when canonical)
+├── configs/                   # canonical .json configs; configs/user/ = saved from the app
 └── results/                   # run outputs: parquet/csv + figures (git-ignored)
 ```
 
@@ -111,9 +111,10 @@ Use the conda environment defined in `environment.yml` (`lda_patch_lab`).
   `st.plotly_chart(on_select="rerun")`, which needs no extra dependency and gives
   exact plane coordinates (`docs/decisions.md` D10). Do not add it back without
   recording a reason there.
-- `pyarrow` (parquet), `streamlit>=1.35`, `plotly` and `matplotlib` are all in
-  `environment.yml`. The streamlit floor is load-bearing: `on_select` arrived in
-  1.35 and the canvas is dead without it.
+- `pyarrow` (parquet), `pydantic>=2`, `streamlit>=1.55`, `plotly` and
+  `matplotlib` are all in `environment.yml`. The streamlit floor was verified by
+  running the app tests across versions (1.54 fails, 1.55 passes;
+  `docs/decisions.md` D15). Re-verify before lowering it.
 - Target Python 3.11. Use `numpy` ≥ 1.24 style (`np.random.default_rng`).
 
 ---
@@ -172,8 +173,8 @@ Analysis quantities:
 
 | Name | Meaning |
 |------|---------|
-| `beta0`, `beta1`, `beta2` | intercept, linear and quadratic coefficients of the fit of `f` on `c` (written β₀, β₁, β₂ in prose). `beta1` is the slope; the LDA intercept is `b_lda`, never `b`. |
-| `kappa` | **curvature index** `|β₂|/|β₁|` — the headline diagnostic. Reserved exclusively for this. |
+| `beta0` … `beta3` | orthogonal-polynomial coefficients of `f` on `c` (β₀ … β₃ in prose). `beta1` is the slope; the LDA intercept is `b_lda`, never `b`. |
+| `kappa` | **curvature index** `√(κ₂² + κ₃²)`, with `κ₂ = |β₂|/|β₁|` (one-sided bend) and `κ₃ = |β₃|/|β₁|` (S-shape). The headline diagnostic; reserved exclusively for this. The cubic part is not optional: saturation around the pivot is S-shaped, which the quadratic term alone cannot see (`docs/decisions.md` D14). |
 | `rho` | Spearman rank correlation between `c` and `f`. |
 | `r` | Pearson correlation between `c` and `f`. |
 
@@ -455,3 +456,15 @@ Read these before debugging something surprising.
    all-dead, all-random and label-shuffle controls. The report must return
    verdict `"degenerate"` and leave those fields `None` rather than emitting
    infinities.
+10. **A failed fit is not a null result.** If every feature is constant within
+    each training class (both extremes fully saturated), the LDA learns a zero
+    weight vector. That reports `fit_failed`, never `degenerate` — the two mean
+    opposite things about the world.
+11. **Symmetric saturation is invisible to a quadratic test.** Clipping at both
+    ends around pivot 0.5 gives an odd-symmetric S-curve with β₂ ≈ 0. Any new
+    curvature diagnostic must be checked against a logistic curve, not just a
+    parabola.
+12. **Streamlit widgets are key-bound; mutations happen in callbacks.** Never
+    write `state[k] = st.widget(..., state[k])`, and never set a widget's key
+    after the widget has been drawn in the current run (`ui/controls.py`
+    module docstring, `docs/decisions.md` D15).
