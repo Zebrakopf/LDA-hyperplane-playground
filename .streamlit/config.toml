@@ -1,0 +1,11 @@
+# Local app settings. Committed on purpose (theme + quiet toolbar for a local tool);
+# secrets.toml, if anyone ever adds one, is git-ignored.
+[theme]
+primaryColor = "#2a78d6"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"
+
+[browser]
+gatherUsageStats = false

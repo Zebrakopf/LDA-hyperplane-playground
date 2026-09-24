@@ -9,14 +9,13 @@ dependencies:
   - pandas
   - pyarrow             # parquet trial tables (storage/io.py)
   - joblib
+  - pydantic>=2         # v2 API (model_copy, model_dump_json, ConfigDict)
   - pytest              # the test suite is part of the deliverable, not optional
-  # The app. The version floor is load-bearing: st.plotly_chart(on_select=...)
-  # arrived in 1.35, and canvas clicks are dead without it (decisions.md D10).
-  - streamlit>=1.35
+  # The app. The floor is VERIFIED, not guessed: tests/test_app.py fails on 1.53
+  # and 1.54 (segmented-control values) and passes on 1.55, 1.56, 1.59 and 1.64
+  # (docs/decisions.md D15).
+  - streamlit>=1.55
   - plotly              # interactive figures (ui/plots.py)
   - matplotlib          # static figures for headless runs (scripts/figures.py)
-  - pip
-  - pip:
-      - pydantic
-      # NOT used: streamlit-drawable-canvas. Native Plotly click events do the
-      # same job with no extra dependency -- see docs/decisions.md D10.
+  # NOT used: streamlit-drawable-canvas. Native Plotly click events do the same job
+  # with no extra dependency (docs/decisions.md D10, D12).

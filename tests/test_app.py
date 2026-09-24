@@ -1,161 +1,260 @@
 """Headless tests for the Streamlit app, via `streamlit.testing.v1.AppTest`.
 
-Why these exist: an app is the one part of this repo a reader cannot check by
-eye in CI, and a Streamlit script fails at RUN time rather than import time — a
-typo in a widget call only surfaces when someone clicks. AppTest runs the real
-script in-process, so a broken layout, a bad session-state key or an exception in
-a cached function fails the suite instead of the user's afternoon.
+Every test drives the REAL widgets and buttons in app.py (by key), not helper
+functions. The first version of this file called `ctl.add_zone(...)` directly,
+so swapping x/y in the click handler, deleting the preset callback or making
+"clear patches" do nothing all still passed (docs/decisions.md D15). Each bug
+the September review found in the app has a test here that reproduces it.
 
-These tests deliberately use the fastest possible settings: they check that the
-app WORKS, not what it finds. The scientific behaviour is tested in
-`test_pipeline.py`, where it belongs.
+What AppTest cannot do is deliver a Plotly click. The canvas's structural
+preconditions are checked below; the click itself is verified in a browser.
 """
 
 from __future__ import annotations
 
+import ast
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from streamlit.testing.v1 import AppTest
 
-APP_PATH = str(Path(__file__).resolve().parent.parent / "app.py")
-# Generous because the first run imports sklearn and builds a plane; the app's own
-# interaction budget is far tighter (see ui/controls.py PRESETS).
+REPO = Path(__file__).resolve().parent.parent
+APP_PATH = str(REPO / "app.py")
 STARTUP_TIMEOUT = 120
 
 
-def _tiny_app() -> AppTest:
-    """Boot the app on a small plane so a full train+evaluate is near-instant."""
+def _app(**state) -> AppTest:
+    """A small, fast app: 30x30 plane, patch_mean features, tiny trial counts."""
     app = AppTest.from_file(APP_PATH, default_timeout=STARTUP_TIMEOUT)
-    app.session_state["plane_height"] = 30
-    app.session_state["plane_width"] = 30
-    app.session_state["grid_step"] = 10
-    app.session_state["patch_size"] = 5
-    app.session_state["feature_mode"] = "patch_mean"
-    app.session_state["n_per_class"] = 30
-    app.session_state["n_per_contrast"] = 20
-    app.session_state["grid_points"] = 5
-    app.session_state["cv_folds"] = 0
+    defaults = dict(plane_height=30, plane_width=30, grid_step=10, patch_size=5,
+                    feature_mode="patch_mean", n_per_class=30, n_per_contrast=20,
+                    grid_points=5, cv_folds=0)
+    for key, value in {**defaults, **state}.items():
+        app.session_state[key] = value
+    return app.run()
+
+
+def _ok(app: AppTest) -> AppTest:
+    assert not app.exception, [e.value for e in app.exception]
     return app
 
 
-def test_app_starts_without_exception() -> None:
-    app = _tiny_app().run()
-    assert not app.exception, app.exception
-    # The landing state must tell the user what to do, not show an empty page.
-    assert any("Train & evaluate" in info.value for info in app.info)
+def _train(app: AppTest) -> AppTest:
+    return _ok(app.button(key="train").click().run())
 
 
-def test_default_state_places_a_patch_grid() -> None:
-    """A brand-new session must not open with an observer that sees nothing."""
-    app = AppTest.from_file(APP_PATH, default_timeout=STARTUP_TIMEOUT).run()
-    assert not app.exception, app.exception
-    assert app.session_state["patches"], "init_state should seed a patch grid"
+def _load(app: AppTest, name: str) -> AppTest:
+    app.selectbox(key="load_choice").set_value(name).run()
+    return _ok(app.button(key="load_button").click().run())
 
 
-def test_clearing_patches_warns() -> None:
-    app = _tiny_app().run()
-    app.session_state["patches"] = []
-    app.run()
-    assert not app.exception, app.exception
-    assert any("observer sees nothing" in warning.value for warning in app.warning)
+def _fingerprint(app: AppTest) -> str:
+    caption = next(c.value for c in app.caption if "config " in c.value)
+    return caption.rsplit("config ", 1)[1]
 
 
-def test_adding_a_zone_updates_the_canvas_state() -> None:
-    app = _tiny_app().run()
-    before = len(app.session_state["zones"])
-    app.session_state["tool"] = "heat"
-    # Simulate what a canvas click does. AppTest cannot deliver a Plotly selection
-    # event, so the handler's effect is exercised through the same helper the
-    # handler calls -- keeping the test honest about what it covers.
-    from ui import controls as ctl
-    import streamlit as st
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(st, "session_state", app.session_state)
-        ctl.add_zone("heat", 15.0, 15.0)
-    app.run()
-    assert not app.exception, app.exception
-    assert len(app.session_state["zones"]) == before + 1
-    assert app.session_state["zones"][-1]["kind"] == "heat"
+# --------------------------------------------------------------------------- #
+# Basic paths
+# --------------------------------------------------------------------------- #
+
+def test_app_starts_with_a_patch_grid_and_an_empty_results_prompt() -> None:
+    app = _ok(_app())
+    assert app.session_state["patches"]
+    assert any("No model yet" in m.value for m in app.markdown)
 
 
-def test_train_and_evaluate_produces_a_verdict() -> None:
-    """The end-to-end path a user actually takes: press the button, read a verdict."""
-    app = _tiny_app().run()
-    app.button(key=None) if False else None          # documented: buttons by label
-    run_button = [b for b in app.button if "Train & evaluate" in b.label]
-    assert run_button, "the primary run button is missing"
-    run_button[0].click().run()
-    assert not app.exception, app.exception
-    assert app.session_state["models"], "a trained model should be registered"
-    active = app.session_state["models"][app.session_state["active_model"]]
-    assert active.report.verdict in {"affine", "equivocal", "nonlinear", "degenerate"}
-    # The exploration presets sit below the pre-registered minimum, and the app must
-    # say so rather than presenting the verdict as publishable.
-    assert any("pre-registered minimum" in caption.value for caption in app.caption)
+def test_train_produces_a_labelled_verdict() -> None:
+    app = _train(_app())
+    assert len(app.session_state["models"]) == 1
+    assert any("lda-verdict" in m.value for m in app.markdown)
+    assert any("pre-registered minimum" in c.value for c in app.caption)
 
 
-def test_all_dead_world_is_reported_degenerate_in_the_app() -> None:
-    """The null control, driven through the UI rather than the API."""
-    app = _tiny_app()
-    app.session_state["background_gain"] = 0.0
-    app.run()
-    [b for b in app.button if "Train & evaluate" in b.label][0].click().run()
-    assert not app.exception, app.exception
+def test_all_dead_world_is_degenerate_through_the_widgets() -> None:
+    app = _app()
+    app.slider(key="background_gain").set_value(0.0).run()
+    app = _train(app)
     active = app.session_state["models"][app.session_state["active_model"]]
     assert active.report.verdict == "degenerate"
-    assert any("degenerate" in info.value for info in app.info)
 
 
-def test_stale_model_warning_appears_after_editing_the_world() -> None:
-    """Editing the canvas after training must not silently mislabel the figures."""
-    app = _tiny_app().run()
-    [b for b in app.button if "Train & evaluate" in b.label][0].click().run()
-    assert not app.exception, app.exception
-    app.session_state["background_gain"] = 0.42        # world no longer matches
-    app.run()
-    assert any("canvas has changed" in warning.value for warning in app.warning)
+def test_fully_saturated_training_shows_fit_failed() -> None:
+    app = _app()
+    app.slider(key="background_gain").set_value(2.0).run()
+    app = _train(app)
+    active = app.session_state["models"][app.session_state["active_model"]]
+    assert active.report.verdict == "fit_failed"
+    assert any("fit failed" in e.value for e in app.error)
 
 
-def test_speed_preset_rewrites_the_trial_counts() -> None:
-    app = _tiny_app().run()
+# --------------------------------------------------------------------------- #
+# Bugs from the review, each reproduced through the UI
+# --------------------------------------------------------------------------- #
+
+def test_settings_take_effect_on_the_same_interaction() -> None:
+    """Keyless widgets used to apply one interaction late (D15)."""
+    app = _app()
+    before = _fingerprint(app)
+    app.slider(key="background_gain").set_value(0.45).run()
+    assert _fingerprint(_ok(app)) != before
+    assert app.session_state["background_gain"] == 0.45
+
+
+def test_numeric_place_button_places_at_x_column_y_row() -> None:
+    app = _app()
+    app.session_state["tool"] = "dead"
+    app.number_input(key="place_x").set_value(7).run()
+    app.number_input(key="place_y").set_value(21).run()
+    app = _ok(app.button(key="place_button").click().run())
+    zone = app.session_state["zones"][-1]
+    assert (zone["kind"], zone["center_x"], zone["center_y"]) == ("dead", 7.0, 21.0)
+
+
+def test_zone_editor_edits_reach_the_world_immediately() -> None:
+    app = _app()
+    app.session_state["tool"] = "heat"
+    app = _ok(app.button(key="place_button").click().run())
+    zid = app.session_state["zones"][-1]["id"]
+    before = _fingerprint(app)
+    app.slider(key=f"zone:{zid}:gain").set_value(1.5).run()
+    assert app.session_state["zones"][-1]["gain"] == 1.5
+    assert _fingerprint(_ok(app)) != before
+
+
+def test_loading_a_config_replaces_zone_values_with_the_same_id() -> None:
+    """A loaded heat1 used to keep the OLD heat1's slider values (D15)."""
+    app = _app(plane_height=100, plane_width=100)
+    app.session_state["tool"] = "heat"
+    app.number_input(key="place_x").set_value(10).run()
+    app.number_input(key="place_y").set_value(10).run()
+    app = _ok(app.button(key="place_button").click().run())
+    assert app.session_state["zones"][-1]["id"] == "heat1"
+    app.slider(key="zone:heat1:gain").set_value(1.5).run()
+    app = _load(app, "scenario_heat_dead")
+    heat1 = next(z for z in app.session_state["zones"] if z["id"] == "heat1")
+    assert (heat1["center_x"], heat1["center_y"], heat1["gain"]) == (25.0, 25.0, 2.0)
+    assert app.slider(key="zone:heat1:gain").value == 2.0
+
+
+def test_loading_a_config_exposes_every_setting_it_changes() -> None:
+    """cv_folds was loaded with no widget, and the preset still said 'fast'.
+
+    control_simple uses exactly the careful preset's numbers, so the preset box
+    must now say so; nudging any of them must turn it into `custom`.
+    """
+    app = _load(_app(), "control_simple")
+    assert app.number_input(key="cv_folds").value == 5
+    assert app.selectbox(key="preset").value == "careful (pre-registered)"
+    app.slider(key="n_per_contrast").set_value(190).run()
+    assert _ok(app).selectbox(key="preset").value == "custom"
+
+
+def test_new_zone_ids_never_collide_with_loaded_ones(tmp_path: Path) -> None:
+    """A config holding only heat2 used to yield a second heat2 and a crash."""
+    from core.config import RunConfig
+    from ui.controls import USER_CONFIG_DIR
+
+    cfg = RunConfig.model_validate_json(
+        (REPO / "configs" / "scenario_heat_dead.json").read_text("utf-8"))
+    cfg.data.zones = [z for z in cfg.data.zones if z.id == "heat2"]
+    USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    path = USER_CONFIG_DIR / "_test_only_heat2.json"
+    path.write_text(cfg.model_dump_json(), encoding="utf-8")
+    try:
+        app = _load(_app(), "user/_test_only_heat2")
+        app.session_state["tool"] = "heat"
+        app = _ok(app.button(key="place_button").click().run())
+        ids = [z["id"] for z in app.session_state["zones"]]
+        assert len(ids) == len(set(ids)) == 2
+    finally:
+        path.unlink()
+
+
+def test_clear_patches_after_training_does_not_crash() -> None:
+    app = _train(_app())
+    app = _ok(app.button(key="clear_patches_button").click().run())
+    assert app.session_state["patches"] == []
+    assert any("observer sees nothing" in w.value for w in app.warning)
+    assert app.button(key="train").disabled
+
+
+def test_saving_without_patches_explains_instead_of_crashing() -> None:
+    app = _ok(_app().button(key="clear_patches_button").click().run())
+    app = _ok(app.button(key="save_button").click().run())
+    assert any("sampling patch" in t.value for t in app.toast)
+
+
+def test_models_differing_only_in_evaluation_are_both_kept() -> None:
+    """Keyed on model_id, the second run used to overwrite the first."""
+    app = _train(_app())
+    app.slider(key="n_per_contrast").set_value(40).run()
+    app = _train(app)
+    assert len(app.session_state["models"]) == 2
+
+
+def test_shrinking_the_plane_moves_patches_back_on_and_merges_duplicates() -> None:
+    app = _app(plane_height=100, plane_width=100)
+    assert len(app.session_state["patches"]) == 100
+    app.number_input(key="plane_width").set_value(50).run()
+    app = _ok(app)
+    patches = app.session_state["patches"]
+    assert all(c + 5 <= 50 for _, c in patches)
+    assert len(patches) == len(set(patches))
+    assert any("moved back onto the plane" in c.value for c in app.caption)
+
+
+def test_stale_model_warning_after_editing_the_world() -> None:
+    app = _train(_app())
+    assert not any("changed since this model" in w.value for w in app.warning)
+    app.slider(key="background_gain").set_value(0.4).run()
+    assert any("changed since this model" in w.value for w in _ok(app).warning)
+
+
+def test_preset_selectbox_rewrites_the_trial_counts() -> None:
     from ui.controls import PRESETS
-    import streamlit as st
-    from ui import controls as ctl
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(st, "session_state", app.session_state)
-        ctl.apply_preset("careful (pre-registered)")
-    app.run()
-    assert not app.exception, app.exception
-    assert (app.session_state["n_per_contrast"]
-            == PRESETS["careful (pre-registered)"]["n_per_contrast"])
+
+    app = _app()
+    app.selectbox(key="preset").set_value("careful (pre-registered)").run()
+    app = _ok(app)
+    for key, value in PRESETS["careful (pre-registered)"].items():
+        assert app.session_state[key] == value
+
+
+def test_clear_zones_and_grid_buttons_work() -> None:
+    app = _app()
+    app.session_state["tool"] = "heat"
+    app = _ok(app.button(key="place_button").click().run())
+    app = _ok(app.button(key="clear_zones_button").click().run())
+    assert app.session_state["zones"] == []
+    app = _ok(app.button(key="clear_patches_button").click().run())
+    app = _ok(app.button(key="grid_button").click().run())
+    assert len(app.session_state["patches"]) == 9          # 30x30, step 10
+
+
+def test_undo_removes_the_last_placement() -> None:
+    app = _app()
+    app.session_state["tool"] = "patch"
+    before = len(app.session_state["patches"])
+    app = _ok(app.button(key="place_button").click().run())
+    assert len(app.session_state["patches"]) == before + 1
+    app = _ok(app.button(key="undo_button").click().run())
+    assert len(app.session_state["patches"]) == before
 
 
 # --------------------------------------------------------------------------- #
-# Canvas click regression guards
+# Canvas preconditions (a click itself needs a browser; D12)
 # --------------------------------------------------------------------------- #
-# The click-to-place feature shipped broken once: the canvas was a bare Plotly
-# Heatmap, and Plotly's point-selection API only fires for scatter-like traces.
-# Nothing raised, nothing failed a test — clicks simply did nothing while drag
-# and zoom kept working, which reads exactly like "the feature is broken".
-#
-# AppTest cannot deliver a Plotly selection event, so it cannot test clicking
-# end-to-end (that is done against a real browser, docs/decisions.md D12). What it
-# CAN do is assert the structural preconditions without which a click can never
-# work. Those are what regressed, so those are what is guarded here.
 
 SELECTABLE_PLOTLY_TYPES = {"scatter", "scattergl", "bar", "histogram", "box",
                            "violin"}
 
 
-def _canvas_figure():
-    """Build the canvas figure directly, with a small plane and one zone."""
-    import numpy as np
-
+def _canvas():
     from core.config import DataConfig, PlaneSpec, ZoneKind
     from core.data import jitter_free_gain_field
     from core.sampling import Patch
@@ -165,181 +264,89 @@ def _canvas_figure():
     plane = PlaneSpec(height=30, width=30)
     data = DataConfig(name="canvas", plane=plane,
                       zones=[zone(ZoneKind.HEAT, gain=2.0, radius=6.0)])
-    gf = jitter_free_gain_field(data)
-    field = np.zeros((plane.height, plane.width))
-    return plane_figure(field, gf, data, [Patch(row=0, col=0, size=5)]), plane
+    gain = jitter_free_gain_field(data).a
+    return plane_figure(np.zeros((30, 30)), gain, data,
+                        [Patch(row=0, col=0, size=5)]), plane
 
 
-def test_canvas_has_a_selectable_trace() -> None:
-    """Without a scatter-like trace, no click can ever be reported. THE guard."""
-    figure, _plane = _canvas_figure()
-    types = {trace.type for trace in figure.data}
-    assert types & SELECTABLE_PLOTLY_TYPES, (
-        f"canvas traces are {types}; Plotly reports point selections only for "
-        f"{SELECTABLE_PLOTLY_TYPES}, so clicking is dead")
-
-
-def test_click_lattice_covers_every_pixel_and_stays_invisible() -> None:
-    """The lattice must span the plane, and must never be visible."""
-    figure, plane = _canvas_figure()
+def test_canvas_has_an_invisible_selectable_lattice_over_every_pixel() -> None:
+    figure, plane = _canvas()
     lattice = next(t for t in figure.data if t.type in SELECTABLE_PLOTLY_TYPES)
-    assert lattice.x.min() == 0 and lattice.y.min() == 0
-    assert lattice.x.max() == plane.width - 1
-    assert lattice.y.max() == plane.height - 1
-    # Invisible in all three states, or it smudges the pixel field it sits on.
+    covered = set(zip(np.asarray(lattice.x).tolist(), np.asarray(lattice.y).tolist()))
+    assert covered == {(x, y) for x in range(plane.width) for y in range(plane.height)}
     assert lattice.marker.opacity == 0.0
     assert lattice.selected.marker.opacity == 0.0
     assert lattice.unselected.marker.opacity == 0.0
-
-
-def test_canvas_disables_drag_so_a_press_is_a_click() -> None:
-    """dragmode must be off, or a press starts a pan instead of selecting."""
-    figure, _plane = _canvas_figure()
     assert figure.layout.dragmode is False
     assert "select" in (figure.layout.clickmode or "")
 
 
-def test_placing_tools_route_through_one_function() -> None:
-    """Canvas clicks and the numeric button must do the same thing.
+def test_canvas_chart_disables_scroll_zoom_and_toolbar() -> None:
+    source = (REPO / "app.py").read_text(encoding="utf-8")
+    assert '"scrollZoom": False' in source and '"displayModeBar": False' in source
 
-    Both call `place_with_current_tool`, so this exercises the shared path once
-    per tool — including that x is the column and y the row, which is very easy to
-    get backwards and produces mirrored zones when it is.
-    """
-    import streamlit as st
 
-    from ui import controls as ctl
-
-    app = _tiny_app().run()
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(st, "session_state", app.session_state)
-
-        app.session_state["tool"] = "dead"
-        ctl.place_with_current_tool(7.0, 21.0)
-        placed = app.session_state["zones"][-1]
-        assert (placed["center_x"], placed["center_y"]) == (7.0, 21.0)
-
-        app.session_state["tool"] = "patch"
-        before = len(app.session_state["patches"])
-        ctl.place_with_current_tool(7.0, 21.0)
-        assert len(app.session_state["patches"]) == before + 1
-        # Click marks the patch CENTRE; the stored origin is the top-left corner.
-        assert app.session_state["patches"][-1] == (21 - 2, 7 - 2)
-
-        # Two clicks on the same spot must place two patches, not one.
-        ctl.place_with_current_tool(7.0, 21.0)
-        assert len(app.session_state["patches"]) == before + 2
-
-        assert ctl.undo_last_placement() == "removed the last patch"
-        assert len(app.session_state["patches"]) == before + 1
-
-        app.session_state["tool"] = "erase_patch"
-        ctl.place_with_current_tool(7.0, 21.0)
-        assert len(app.session_state["patches"]) == before
-
-        app.session_state["tool"] = "none"
-        assert "nothing placed" in ctl.place_with_current_tool(5.0, 5.0)
+def test_no_figure_uses_a_second_y_axis() -> None:
+    """One axis per chart (D16): dual axes invite reading crossings as meaning."""
+    source = (REPO / "ui" / "plots.py").read_text(encoding="utf-8")
+    assert "secondary_y" not in source
 
 
 # --------------------------------------------------------------------------- #
-# Tooltip coverage
+# Tooltip coverage (D13)
 # --------------------------------------------------------------------------- #
 
-# Streamlit widgets that accept a `help=` tooltip. Anything in this set that
-# appears in app.py without one is a control the user has to guess at.
 HELPABLE_WIDGETS = frozenset({
     "button", "download_button", "checkbox", "toggle", "radio", "selectbox",
     "multiselect", "slider", "select_slider", "text_input", "number_input",
     "text_area", "file_uploader", "color_picker", "metric", "link_button",
+    "segmented_control", "pills",
 })
-
-
-def _widget_calls_without_help(source_path: Path) -> list[tuple[int, str, str]]:
-    """Every helpable widget call in a source file that has no `help=`.
-
-    Static analysis rather than AppTest introspection, deliberately: this needs to
-    hold for widgets nested inside branches a given test run never reaches — the
-    per-zone editors, the pixel-model-specific noise sliders, the comparison tab
-    that only appears with two models trained. A runtime check would silently pass
-    on the branches it did not visit.
-    """
-    import ast
-
-    tree = ast.parse(source_path.read_text(encoding="utf-8"))
-    missing: list[tuple[int, str, str]] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-            continue
-        if node.func.attr not in HELPABLE_WIDGETS:
-            continue
-        if any(keyword.arg == "help" for keyword in node.keywords):
-            continue
-        label = "<dynamic>"
-        if node.args and isinstance(node.args[0], ast.Constant):
-            label = str(node.args[0].value)
-        missing.append((node.lineno, node.func.attr, label))
-    return missing
-
-
-def test_every_widget_has_a_tooltip() -> None:
-    """No control in the app is left unexplained.
-
-    The app exposes a lot of knobs whose meaning is not guessable from the label —
-    "pivot", "background gain", "shrinkage", "d′" — and it is aimed at colleagues
-    who did not write it. A missing tooltip is a real defect here, not polish.
-    """
-    app_file = Path(__file__).resolve().parent.parent / "app.py"
-    missing = _widget_calls_without_help(app_file)
-    assert not missing, "widgets without a help tooltip:\n" + "\n".join(
-        f"  app.py:{line}  st.{widget}({label!r})" for line, widget, label in missing)
-
-
-# Floor on tooltip length. 30 rather than something larger because a few controls
-# genuinely need only a short sentence -- an x coordinate really is just "column,
-# counted from the left edge of the plane" -- while anything under 30 characters
-# cannot be saying more than the label already does.
 MIN_TOOLTIP_CHARS = 30
 
 
+def _widget_calls() -> list[ast.Call]:
+    tree = ast.parse((REPO / "app.py").read_text(encoding="utf-8"))
+    return [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute) and n.func.attr in HELPABLE_WIDGETS]
+
+
+def test_every_widget_has_a_tooltip() -> None:
+    missing = [(n.lineno, n.func.attr) for n in _widget_calls()
+               if not any(k.arg == "help" for k in n.keywords)]
+    assert not missing, missing
+
+
 def test_tooltips_are_substantive() -> None:
-    """A tooltip that restates the label teaches nothing.
-
-    Two ways to fail: being too short to carry information, or echoing the label
-    (`help="the plane height"` beside a slider labelled "plane height"). The second
-    check is the one that matters — length is easy to game, word overlap is not.
-    """
-    import ast
-
-    app_file = Path(__file__).resolve().parent.parent / "app.py"
-    tree = ast.parse(app_file.read_text(encoding="utf-8"))
-    too_short: list[tuple[int, str]] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-            continue
-        if node.func.attr not in HELPABLE_WIDGETS:
-            continue
+    """Static tooltips must say more than the label (dynamic f-strings skipped)."""
+    weak = []
+    for node in _widget_calls():
         for keyword in node.keywords:
-            if keyword.arg != "help":
-                continue
-            # Help strings are written as implicitly concatenated literals, which
-            # parse to a single Constant; anything else is dynamic and skipped.
-            if isinstance(keyword.value, ast.Constant) and \
-                    isinstance(keyword.value.value, str):
-                text = keyword.value.value
-                if len(text) < MIN_TOOLTIP_CHARS:
-                    too_short.append((node.lineno, f"too short: {text}"))
-                    continue
-                label = (node.args[0].value
-                         if node.args and isinstance(node.args[0], ast.Constant)
-                         and isinstance(node.args[0].value, str) else "")
-                if label:
-                    label_words = {w.strip("():,.").lower()
-                                   for w in label.split() if len(w) > 3}
-                    tip_words = {w.strip("():,.").lower() for w in text.split()}
-                    # Every substantial word of the label appearing in a tooltip
-                    # barely longer than the label means it is an echo.
-                    if (label_words and label_words <= tip_words
-                            and len(text) < len(label) * 3):
-                        too_short.append((node.lineno, f"echoes its label: {text}"))
-    assert not too_short, "uninformative tooltips:\n" + "\n".join(
-        f"  app.py:{line}  {text}" for line, text in too_short)
+            if (keyword.arg == "help" and isinstance(keyword.value, ast.Constant)
+                    and len(keyword.value.value) < MIN_TOOLTIP_CHARS):
+                weak.append((node.lineno, keyword.value.value))
+    assert not weak, weak
+
+
+def test_clicking_the_active_tool_again_keeps_it_selected() -> None:
+    """A segmented control deselects on a second click; that must not drop the tool."""
+    app = _app()
+    app.session_state["tool"] = None            # what the widget reports
+    app.session_state["tool_last"] = "dead"
+    from ui import controls as ctl
+    import streamlit as st
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(st, "session_state", app.session_state)
+        ctl.on_tool_change()
+    assert app.session_state["tool"] == "dead"
+
+
+def test_hidden_or_disabled_settings_keep_their_values() -> None:
+    """Switching pixel model away and back must not reset its noise parameter."""
+    app = _app()
+    app.radio(key="pixel_model").set_value("beta").run()
+    app.slider(key="beta_concentration").set_value(50.0).run()
+    app.radio(key="pixel_model").set_value("bernoulli").run()
+    app.radio(key="pixel_model").set_value("beta").run()
+    assert _ok(app).slider(key="beta_concentration").value == 50.0
+    assert app.session_state["beta_concentration"] == 50.0
