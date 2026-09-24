@@ -37,6 +37,7 @@ from core.dataset import build_evaluation_set, build_training_set
 from core.model import (
     TrainedModel,
     decision_values,
+    separation_d_prime,
     scaled_features,
     train_lda,
     weights_in_pixel_space,
@@ -61,6 +62,12 @@ NESTED_ALPHA = 0.01          # nested F-test significance level
 SD_RATIO_HOMOSCEDASTIC = 1.5  # max/min SD(f|c) below this counts as homoscedastic
 CI_LEVEL = 0.95
 
+# A contrast level whose SD is below this fraction of the largest level's SD is
+# treated as structurally zero-variance. Needed because a deterministic level
+# (Bernoulli at theta in {0, 1}) comes out of pandas as ~1e-12, not 0.0, and an
+# exact `> 0` test then let it through and produced ratios like 7e13.
+ZERO_SD_RELATIVE_TOL = 1e-9
+
 # A slope must beat its own standard error by this margin before any
 # slope-normalised diagnostic is computed.
 #
@@ -68,9 +75,11 @@ CI_LEVEL = 0.95
 # noise that test flags a significant slope 5% of the time BY CONSTRUCTION, so
 # across four null controls x five seeds it would wrongly declare roughly one run
 # non-degenerate every batch, and Phase-1 exit criterion 2 would fail at random.
-# Measured over 200 simulated null runs at the default grid, |t| never exceeded
-# 0.13, while a real mapping reaches |t| in the hundreds. At the default 4200
-# evaluation trials t = 10 corresponds to |r| ~ 0.155, i.e. this also refuses to
+# Measured over 200 simulated N(0,1) null runs at the default grid, max |t| was
+# about 2.6 (10 of 200 exceeded the 5% critical value, as they must), while a
+# real mapping reaches |t| in the hundreds. At the default 4200 evaluation trials
+# t = 10 corresponds to |r| ~ 0.155 (|r| ~ 0.36 at the fast preset's 660), i.e.
+# this also refuses to
 # report a curvature ratio when the linear component is buried in trial noise —
 # which is the honest answer, since kappa divides by that component.
 # Superseded the CI-covers-zero rule of plan.md §1.3; see docs/decisions.md.
@@ -102,6 +111,8 @@ class LinearityReport:
     r2: float
     poly_coefs: dict[str, float]
     curvature_index: float | None          # kappa — the headline number
+    kappa_quadratic: float | None          # |beta2|/|beta1|: one-sided bend
+    kappa_cubic: float | None              # |beta3|/|beta1|: S-shape / saturation
     nested_f: dict[str, float]
     max_local_slope_ratio: float | None
     effective_range_use: float | None
@@ -109,13 +120,15 @@ class LinearityReport:
     n_zero_variance_levels: int
     homoscedastic: bool
     monotonicity_violations: int
-    verdict: Literal["affine", "equivocal", "nonlinear", "degenerate"]
+    verdict: Literal["affine", "equivocal", "nonlinear", "degenerate", "fit_failed"]
 
     def summary_row(self) -> dict[str, object]:
         """One flat row for the cross-condition table (plan.md §7.6)."""
         return {
             "verdict": self.verdict,
             "kappa": self.curvature_index,
+            "kappa_quadratic": self.kappa_quadratic,
+            "kappa_cubic": self.kappa_cubic,
             "spearman_rho": self.spearman_rho,
             "pearson_r": self.pearson_r,
             "r2": self.r2,
@@ -127,6 +140,8 @@ class LinearityReport:
             "calibration_rmse": (float(self.calibration["rmse"].mean())
                                  if self.calibration is not None else None),
             "nested_p_quadratic": self.nested_f.get("p_quadratic"),
+            "nested_p_cubic": self.nested_f.get("p_cubic"),
+            "effective_range_use": self.effective_range_use,
             "monotonicity_violations": self.monotonicity_violations,
             "mean_clip_fraction": float(self.clip_by_c["mean_clip_fraction"].mean()),
         }
@@ -162,6 +177,32 @@ class ExperimentResult:
     attribution: WeightAttribution
     composition: pd.DataFrame
     provenance: dict[str, str]
+    # d' between the two TRAINING extremes, measured on FRESH evaluation trials
+    # at the grid levels nearest c_lo and c_hi. The in-sample d' on the model
+    # overstates separation badly when features outnumber trials: the all-random
+    # control reads 3.6 in-sample and ~0.03 here.
+    fresh_d_prime: float = float("nan")
+    fresh_d_prime_levels: tuple[float, float] = (float("nan"), float("nan"))
+
+
+def fresh_separation(trials: pd.DataFrame, c_lo: float,
+                     c_hi: float) -> tuple[float, tuple[float, float]]:
+    """d' on held-out trials at the grid levels closest to the training extremes.
+
+    Returns
+    -------
+    (d_prime, (level_lo, level_hi)). NaN when the grid has fewer than two levels.
+    """
+    levels = np.unique(trials["c"].to_numpy())
+    if levels.size < 2:
+        return float("nan"), (float("nan"), float("nan"))
+    level_lo = float(levels[np.argmin(np.abs(levels - c_lo))])
+    level_hi = float(levels[np.argmin(np.abs(levels - c_hi))])
+    if level_lo == level_hi:
+        return float("nan"), (level_lo, level_hi)
+    f_lo = trials.loc[trials["c"] == level_lo, "f"].to_numpy()
+    f_hi = trials.loc[trials["c"] == level_hi, "f"].to_numpy()
+    return separation_d_prime(f_lo, f_hi), (level_lo, level_hi)
 
 
 def _orthogonal_polynomial_basis(c: FloatArray, degree: int) -> FloatArray:
@@ -300,8 +341,22 @@ def linearity_report(trials: pd.DataFrame, f_column: str = "f") -> LinearityRepo
     poly_coefficients, *_ = np.linalg.lstsq(basis, f, rcond=None)
     poly_coefs = {f"beta{i}": float(v) for i, v in enumerate(poly_coefficients)}
     linear_term = abs(poly_coefficients[1])
-    curvature_index = (None if degenerate or linear_term == 0.0
-                       else float(abs(poly_coefficients[2]) / linear_term))
+    # kappa combines the quadratic AND cubic orthogonal components.
+    #
+    # The first version used |beta2| / |beta1| alone, and that was blind to the
+    # most important failure this project exists to detect. Saturation here is
+    # symmetric about the pivot (0.5): clipping flattens BOTH ends, producing an
+    # S-shaped curve that is odd-symmetric, so beta2 ~ 0 while beta3 is large. A
+    # logistic curve with slope 12 scored kappa = 0.001 and was called "affine"
+    # (docs/decisions.md D14). The quadratic term catches one-sided bends, the
+    # cubic term catches S-shapes; the Euclidean combination is invariant to
+    # which of the two a curve has, and reduces to the old index when beta3 = 0.
+    if degenerate or linear_term == 0.0:
+        curvature_index = kappa_quadratic = kappa_cubic = None
+    else:
+        kappa_quadratic = float(abs(poly_coefficients[2]) / linear_term)
+        kappa_cubic = float(abs(poly_coefficients[3]) / linear_term)
+        curvature_index = float(np.hypot(kappa_quadratic, kappa_cubic))
     nested_f = _nested_f_tests(c, f)
 
     # --- shape of the mean curve ---------------------------------------------
@@ -322,12 +377,21 @@ def linearity_report(trials: pd.DataFrame, f_column: str = "f") -> LinearityRepo
         max_local_slope_ratio = (float(magnitudes.max() / smallest) if smallest > 0
                                  else float("inf"))
         # How much of the output range is spent on the middle half of the input?
-        # An S-shaped or end-compressed curve spends much more than half.
-        low, high = np.quantile(contrasts, [0.25, 0.75])
-        middle = (contrasts >= low) & (contrasts <= high)
+        # A straight line spends exactly 0.5; an S-shaped curve spends more, an
+        # end-expanded one less.
+        #
+        # The mean curve is INTERPOLATED at the quarter points of the c range.
+        # Selecting the grid points that happen to fall between the quartiles
+        # made the answer depend on the grid: a perfectly straight line read 0.40
+        # on the fast preset's 11-point grid and 0.50 on the 21-point grid.
+        c_min, c_max = float(contrasts.min()), float(contrasts.max())
+        q1 = c_min + 0.25 * (c_max - c_min)
+        q3 = c_min + 0.75 * (c_max - c_min)
         total_span = float(curve.max() - curve.min())
-        effective_range_use = (float(np.ptp(curve[middle]) / total_span)
-                               if total_span > 0 else None)
+        effective_range_use = (
+            float(abs(np.interp(q3, contrasts, curve) - np.interp(q1, contrasts, curve))
+                  / total_span)
+            if total_span > 0 else None)
         # Calibration: invert the affine fit and ask how wrong `f` is when used
         # as a measurement of `c` — the practical question behind H2.
         c_hat = (f - beta0) / beta1
@@ -349,20 +413,24 @@ def linearity_report(trials: pd.DataFrame, f_column: str = "f") -> LinearityRepo
     #             asked (does precision vary across the range where there IS
     #             variance?), and `n_zero_variance_levels` reports how many were
     #             dropped so the exclusion is never invisible.
-    sd_values = sd_by_c["sd_f"].to_numpy()
-    n_zero_variance_levels = int(np.sum(~(sd_values > 0)))
-    informative_sd = sd_values[sd_values > 0]
+    sd_values = np.nan_to_num(sd_by_c["sd_f"].to_numpy(), nan=0.0)
+    sd_floor = ZERO_SD_RELATIVE_TOL * float(sd_values.max()) if sd_values.size else 0.0
+    informative = sd_values > sd_floor
+    n_zero_variance_levels = int(np.sum(~informative))
+    informative_sd = sd_values[informative]
     sd_ratio = (float(informative_sd.max() / informative_sd.min())
                 if informative_sd.size else float("nan"))
 
     # --- pre-registered verdict (plan.md §1.3), evaluated in this order --------
     if degenerate:
-        verdict: Literal["affine", "equivocal", "nonlinear", "degenerate"] = "degenerate"
+        verdict: Literal["affine", "equivocal", "nonlinear", "degenerate",
+                         "fit_failed"] = "degenerate"
     elif curvature_index is not None and curvature_index < KAPPA_AFFINE:
         verdict = "affine"
     elif curvature_index is not None and (
         curvature_index > KAPPA_NONLINEAR
-        or nested_f.get("p_quadratic", 1.0) < NESTED_ALPHA
+        or min(nested_f.get("p_quadratic", 1.0), nested_f.get("p_cubic", 1.0))
+        < NESTED_ALPHA
     ):
         verdict = "nonlinear"
     else:
@@ -389,6 +457,8 @@ def linearity_report(trials: pd.DataFrame, f_column: str = "f") -> LinearityRepo
         r2=r2,
         poly_coefs=poly_coefs,
         curvature_index=curvature_index,
+        kappa_quadratic=kappa_quadratic,
+        kappa_cubic=kappa_cubic,
         nested_f=nested_f,
         max_local_slope_ratio=max_local_slope_ratio,
         effective_range_use=effective_range_use,
@@ -469,7 +539,12 @@ def weight_attribution(model: TrainedModel, data: DataConfig,
     w_pixels = weights_in_pixel_space(model, data.plane)
     sampled = ~np.isnan(w_pixels)
     w_flat = w_pixels[sampled]
-    a_flat = gf.a[sampled]
+    # Effective gain: a random-masked pixel ignores c, so its true coupling is 0
+    # whatever the composed `a` says there. Using raw `a` credited masked pixels
+    # with gain ~1 and made the all-random control look like it had signal.
+    effective_gain = np.where(gf.random_mask, 0.0, gf.a)
+    a_flat = effective_gain[sampled]
+    masked_flat = gf.random_mask[sampled]
 
     abs_correlation = (float(stats.pearsonr(np.abs(w_flat), np.abs(a_flat)).statistic)
                        if w_flat.size > 2 and np.std(np.abs(w_flat)) > 0
@@ -497,6 +572,8 @@ def weight_attribution(model: TrainedModel, data: DataConfig,
         ) if coupling.any() else np.ones(w_flat.size)
     else:
         background_share = np.ones(w_flat.size)
+    # A masked pixel is not background: it does not track c at the baseline rate.
+    background_share = np.where(masked_flat, 0.0, background_share)
     inside_background = background_share >= 0.5
     rows.append({
         "kind": "background",
@@ -512,7 +589,7 @@ def weight_attribution(model: TrainedModel, data: DataConfig,
         sign_agreement=sign_agreement,
         mean_signed_weight_by_kind=pd.DataFrame(rows),
         w_pixels=w_pixels,
-        true_gain=gf.a,
+        true_gain=effective_gain,
     )
 
 
@@ -560,6 +637,13 @@ def run_experiment(cfg: RunConfig, provenance: dict[str, str] | None = None,
                             bundle_for(streams, "eval"), patches)
 
     report = linearity_report(trials, "f")
+    if model.diagnostics.fit_failed:
+        # A model with nothing to learn must not masquerade as a null result:
+        # `degenerate` means "c is not linearly readable", this means "the fit
+        # never happened". The oracle report below is unaffected.
+        report.verdict = "fit_failed"
+    fresh_d_prime, fresh_levels = fresh_separation(trials, cfg.training.c_lo,
+                                                   cfg.training.c_hi)
     oracle_report = (linearity_report(trials, "f_oracle")
                      if "f_oracle" in trials.columns else None)
     attribution = weight_attribution(model, cfg.data, patches)
@@ -579,4 +663,6 @@ def run_experiment(cfg: RunConfig, provenance: dict[str, str] | None = None,
         attribution=attribution,
         composition=composition,
         provenance=provenance or {},
+        fresh_d_prime=fresh_d_prime,
+        fresh_d_prime_levels=fresh_levels,
     )

@@ -30,12 +30,25 @@ from enum import StrEnum
 from typing import Literal
 
 import numpy as np
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # Number of points on the default evaluation contrast grid. Named because both
 # the grid default and the documented trial count (21 * n_per_contrast) depend
 # on it.
 DEFAULT_GRID_POINTS = 21
+
+
+class StrictModel(BaseModel):
+    """Base for every config object.
+
+    `extra="forbid"`: a typo in a config file (`"n_per_clas": 5`) is an error,
+    not a silently ignored key that leaves the default in place.
+    `validate_assignment=True`: editing a loaded config (the scripts do, for
+    `--quick` and `--seeds`) re-runs validation, so an illegal combination such
+    as svd + shrinkage cannot be smuggled in after load.
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
 
 class ZoneKind(StrEnum):
@@ -56,7 +69,7 @@ class Falloff(StrEnum):
     GAUSSIAN = "gaussian"
 
 
-class ZoneSpec(BaseModel):
+class ZoneSpec(StrictModel):
     """One circular region that modifies the coupling between `c` and pixels.
 
     A zone is part of the WORLD, not of the observer. See invariant I1.
@@ -74,7 +87,7 @@ class ZoneSpec(BaseModel):
     priority: int = 0                         # used by overlap_mode == "replace"
 
 
-class JitterSpec(BaseModel):
+class JitterSpec(StrictModel):
     """Per-trial perturbation of zone geometry — a coherent nuisance latent.
 
     Unlike pixel noise this is NOT i.i.d.: it moves whole zones together within
@@ -88,7 +101,7 @@ class JitterSpec(BaseModel):
     gain_sigma: float = 0.0                   # > 0 can push |a| past 1 => enables clipping
 
 
-class NoiseSpec(BaseModel):
+class NoiseSpec(StrictModel):
     """Pixel-level observation model and its noise parameters (plan.md §4.6)."""
 
     pixel_model: Literal["bernoulli", "clipped_gaussian", "beta"] = "bernoulli"
@@ -98,14 +111,14 @@ class NoiseSpec(BaseModel):
     random_zone_dist: Literal["bernoulli_half", "uniform"] = "bernoulli_half"
 
 
-class PlaneSpec(BaseModel):
+class PlaneSpec(StrictModel):
     """Size of the pixel plane. Configurable; 100x100 is only the default."""
 
     height: int = 100
     width: int = 100
 
 
-class DataConfig(BaseModel):
+class DataConfig(StrictModel):
     """The WORLD: how the latent contrast maps onto pixel statistics.
 
     Never merged with, nested in, or read alongside `SamplingConfig` (I1).
@@ -175,7 +188,7 @@ class DataConfig(BaseModel):
         return False
 
 
-class SamplingConfig(BaseModel):
+class SamplingConfig(StrictModel):
     """The OBSERVER: which pixels the model gets to see, and as what features.
 
     Never merged with, nested in, or read alongside `DataConfig` (I1).
@@ -200,7 +213,7 @@ class SamplingConfig(BaseModel):
         return self
 
 
-class TrainingConfig(BaseModel):
+class TrainingConfig(StrictModel):
     """How the LDA is trained. Only the two extremes are ever seen (I5)."""
 
     c_lo: float = 0.05                        # interior by default: see plan.md §6.2
@@ -223,7 +236,7 @@ class TrainingConfig(BaseModel):
         return self
 
 
-class EvalConfig(BaseModel):
+class EvalConfig(StrictModel):
     """The contrast grid on which the trained model is probed."""
 
     contrast_grid: list[float] = Field(
@@ -233,7 +246,7 @@ class EvalConfig(BaseModel):
     compute_oracle: bool = True
 
 
-class RunConfig(BaseModel):
+class RunConfig(StrictModel):
     """Everything needed to reproduce one experiment, plus one master seed."""
 
     data: DataConfig

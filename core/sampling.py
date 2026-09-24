@@ -184,7 +184,11 @@ def sampled_area_composition(patches: Sequence[Patch], gf: GainField,
     if indices.size == 0:
         return pd.DataFrame(columns=["kind", "weight_fraction", "mean_gain", "sd_gain"])
 
-    gain_sampled = gf.a.ravel()[indices]
+    masked_sampled = gf.random_mask.ravel()[indices]
+    # Effective gain: a masked pixel ignores c, so it carries gain 0 here rather
+    # than the composed `a` underneath the mask (which reads ~1 and made the
+    # all-random control report a mean sampled gain of 1.0).
+    gain_sampled = np.where(masked_sampled, 0.0, gf.a.ravel()[indices])
     rows: list[dict[str, object]] = []
 
     def _gain_stats(inside: npt.NDArray[np.bool_]) -> tuple[float, float]:
@@ -220,13 +224,16 @@ def sampled_area_composition(patches: Sequence[Patch], gf: GainField,
                              "weight_fraction": float(masked.mean()),
                              "mean_gain": mean_gain, "sd_gain": sd_gain})
                 continue
-            share = weight / denominator
+            share = np.where(masked_sampled, 0.0, weight / denominator)
             mean_gain, sd_gain = _gain_stats(share >= 0.5)
             rows.append({"kind": str(kind), "weight_fraction": float(share.mean()),
                          "mean_gain": mean_gain, "sd_gain": sd_gain})
         background_share = background_weight / denominator
     else:
         background_share = np.ones(indices.size)
+    # Masked pixels belong to the `random` row only; counting them as background
+    # too made the all-random control's fractions add up to 2.0.
+    background_share = np.where(masked_sampled, 0.0, background_share)
 
     background_mean, background_sd = _gain_stats(background_share >= 0.5)
     rows.append({"kind": "background",

@@ -38,10 +38,15 @@ from core.sampling import Patch, patch_pixel_indices
 
 FloatArray = npt.NDArray[np.float64]
 
-# Singular values below this multiple of the largest one count as numerical zero
-# when computing effective rank. Matches numpy's default matrix_rank tolerance
-# scale, made explicit because rank is a reported diagnostic here.
-RANK_TOLERANCE = 1e-12
+# A singular value below `max(shape) * eps * s_max` counts as numerical zero —
+# numpy's own `matrix_rank` default, applied to SINGULAR values (the first
+# version applied a fixed 1e-12 to their squares, i.e. ~1e-6 on the singular
+# values, which is a different and much looser rule than the comment claimed).
+RANK_EPS = float(np.finfo(np.float64).eps)
+
+# Features whose training variance is below this are treated as constant. Used
+# to detect a fit that had nothing to learn from.
+CONSTANT_FEATURE_TOL = 1e-12
 
 
 @dataclass
@@ -52,16 +57,18 @@ class TrainingDiagnostics:
     on a handful of pixels will not survive a change of seed.
     """
 
-    train_accuracy: float
+    train_accuracy: float                  # IN-SAMPLE: on the data it was fitted to
     cv_accuracy: float
     cv_accuracy_sd: float
-    d_prime: float
+    d_prime: float                         # IN-SAMPLE; see ExperimentResult.fresh_d_prime
     cov_condition_number: float
     effective_rank: int
     n_features: int
     n_train: int
     weight_norm: float
     top1pct_weight_mass: float
+    fit_failed: bool = False               # the LDA had no usable direction to learn
+    fit_problem: str = ""                  # human-readable reason when fit_failed
 
 
 @dataclass
@@ -102,12 +109,49 @@ def _pooled_covariance_spectrum(X_scaled: FloatArray,
     singular = np.linalg.svd(centred, compute_uv=False)
     if singular.size == 0 or singular[0] == 0.0:
         return float("inf"), 0
-    eigenvalues = singular ** 2
-    rank = int((eigenvalues > eigenvalues[0] * RANK_TOLERANCE).sum())
-    n_possible = min(X_scaled.shape)
-    if rank < n_possible or X_scaled.shape[1] > rank:
-        return float("inf"), rank
-    return float(eigenvalues[0] / eigenvalues[-1]), rank
+    tolerance = singular[0] * max(X_scaled.shape) * RANK_EPS
+    rank = int((singular > tolerance).sum())
+    if rank < X_scaled.shape[1]:
+        return float("inf"), rank          # rank-deficient: covariance singular
+    return float((singular[0] / singular[-1]) ** 2), rank
+
+
+def separation_d_prime(f_class0: FloatArray, f_class1: FloatArray) -> float:
+    """d' = |mean1 - mean0| / pooled SD between two sets of decision values.
+
+    Returns NaN for 0/0 (no separation AND no spread, e.g. an all-zero weight
+    vector) rather than the `inf` the first version reported, which read as
+    "perfectly separated" for a model that had learned nothing.
+    """
+    difference = abs(float(np.mean(f_class1)) - float(np.mean(f_class0)))
+    pooled_sd = float(np.sqrt(0.5 * (np.var(f_class0) + np.var(f_class1))))
+    if pooled_sd > 0:
+        return difference / pooled_sd
+    return float("inf") if difference > 0 else float("nan")
+
+
+def _diagnose_fit(X_raw: FloatArray, y: npt.NDArray[np.int64],
+                  w: FloatArray) -> tuple[bool, str]:
+    """Did the LDA have anything to learn from?
+
+    Catches the case the first version silently reported as a null result: if
+    both training extremes saturate (every pixel clipped to 0 at c_lo and to 1
+    at c_hi), every feature is constant within each class, the covariance is
+    all zeros, and scikit-learn returns a zero weight vector. The evaluation
+    then reads `degenerate` — exactly like "nothing tracks c" — while the oracle
+    on the same data shows a strong slope. That is a failed fit, not a finding.
+    """
+    within_variance = np.zeros(X_raw.shape[1])
+    for label in np.unique(y):
+        within_variance += X_raw[y == label].var(axis=0)
+    if np.all(within_variance < CONSTANT_FEATURE_TOL):
+        return True, ("every feature is constant within each training class — "
+                      "typically both extremes saturate (all pixels clipped), so "
+                      "there is no within-class variance to fit a discriminant to. "
+                      "Move c_lo/c_hi inward or lower the gains.")
+    if not np.any(np.abs(w) > 0):
+        return True, "the fitted weight vector is exactly zero."
+    return False, ""
 
 
 def train_lda(train: TrialSet, training: TrainingConfig, sampling: SamplingConfig,
@@ -157,10 +201,10 @@ def train_lda(train: TrialSet, training: TrainingConfig, sampling: SamplingConfi
     lda.fit(X, train.y)
 
     f_train = lda.decision_function(X)
-    mean_1, mean_0 = f_train[train.y == 1].mean(), f_train[train.y == 0].mean()
-    var_1, var_0 = f_train[train.y == 1].var(), f_train[train.y == 0].var()
-    pooled_sd = np.sqrt(0.5 * (var_0 + var_1))
-    d_prime = float(abs(mean_1 - mean_0) / pooled_sd) if pooled_sd > 0 else float("inf")
+    d_prime = separation_d_prime(f_train[train.y == 0], f_train[train.y == 1])
+    fit_failed, fit_problem = _diagnose_fit(train.X, train.y, np.ravel(lda.coef_))
+    if fit_failed:
+        warnings.warn(f"LDA fit failed: {fit_problem}", stacklevel=2)
 
     condition_number, effective_rank = _pooled_covariance_spectrum(X, train.y)
 
@@ -194,6 +238,8 @@ def train_lda(train: TrialSet, training: TrainingConfig, sampling: SamplingConfi
         n_train=int(X.shape[0]),
         weight_norm=float(np.linalg.norm(w)),
         top1pct_weight_mass=top_mass,
+        fit_failed=fit_failed,
+        fit_problem=fit_problem,
     )
     return TrainedModel(
         lda=lda,

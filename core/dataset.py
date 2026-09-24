@@ -122,10 +122,34 @@ def build_training_set(data: DataConfig, sampling: SamplingConfig,
     )
     y = (trials.c > (training.c_lo + training.c_hi) / 2.0).astype(np.int64)
     if training.shuffle_labels:
-        y = y[rng_labels.permutation(y.size)]
+        y = _balanced_shuffle(y, rng_labels)
     trials.y = y
     trials.meta = trials.meta.assign(y=y)
     return trials
+
+
+def _balanced_shuffle(y: npt.NDArray[np.int64],
+                      rng: Generator) -> npt.NDArray[np.int64]:
+    """Labels that are exactly independent of the true extreme.
+
+    Within each true class, a random half gets label 0 and the other half label
+    1. A plain `permutation(y)` does not achieve that: by chance each shuffled
+    class holds an unequal mix of c_lo and c_hi trials, which leaks a real slope
+    into the "null" control — on the fast preset its |t| reached 9.3 against a
+    degeneracy threshold of 10 (docs/decisions.md D14).
+
+    Returns
+    -------
+    (n_trials,) int array with the same class counts as `y`.
+    """
+    shuffled = np.empty_like(y)
+    for label in np.unique(y):
+        members = np.flatnonzero(y == label)
+        order = rng.permutation(members.size)
+        half = members.size // 2
+        shuffled[members[order[:half]]] = 0
+        shuffled[members[order[half:]]] = 1
+    return shuffled
 
 
 def build_evaluation_set(data: DataConfig, sampling: SamplingConfig,

@@ -95,8 +95,11 @@ def zone_weight_map(zone: ZoneSpec, plane: PlaneSpec, *, dx: float = 0.0,
     -------
     (H, W) float array in [0, 1].
 
-    The three falloff profiles agree in the limit `falloff_width -> 0`, so a
-    config can be moved between them without changing the zone's nominal extent.
+    The three profiles agree only in the limit `falloff_width -> 0`. At nonzero
+    width they differ in WHERE the edge sits: `smoothstep` fades from 1 at
+    `radius - width` to 0 at `radius` (the zone ends at its radius), while
+    `gaussian` is 1 out to `radius` and decays beyond it (the zone extends past
+    its radius). Switching profile therefore changes a zone's effective size.
 
     ASSUMPTION: membership is isotropic and depends only on distance to centre.
     ARTEFACT:   `hard` edges are a step in the coupling field. A 5x5 patch
